@@ -13,7 +13,7 @@ const mockStocks: Record<string, { price: number; high52: number; low52: number;
 async function fetchStockData(symbol: string) {
   try {
     // Sanitize symbol: allow only alphanumeric characters and dots
-    const safeSymbol = symbol.replace(/[^A-Z0-9.]/g, "");
+    const safeSymbol = symbol.toUpperCase().replace(/[^A-Z0-9.]/g, "");
     if (!safeSymbol) throw new Error("Invalid symbol");
     const yahooUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(safeSymbol)}.NS`);
     yahooUrl.searchParams.set("interval", "1d");
@@ -83,8 +83,7 @@ function runRuleEngine(
   }
 
   // Rule 6: Rounded number (impulse buy vibes)
-  // Flag amounts divisible by 5000, or divisible by 1000 but not 5000
-  if (amount % 5000 === 0 || (amount % 1000 === 0 && amount % 5000 !== 0)) {
+  if (amount % 1000 === 0) {
     warnings.push(`Impulse buy vibes 🤔 — ₹${amount.toLocaleString("en-IN")} is a suspiciously round number. Did you actually calculate this, or did you just pick a round figure?`);
   }
 
