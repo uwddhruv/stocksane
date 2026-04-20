@@ -12,7 +12,10 @@ const mockStocks: Record<string, { price: number; high52: number; low52: number;
 
 async function fetchStockData(symbol: string) {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1y`;
+    // Sanitize symbol: allow only alphanumeric characters and dots
+    const safeSymbol = symbol.replace(/[^A-Z0-9.]/g, "");
+    if (!safeSymbol) throw new Error("Invalid symbol");
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${safeSymbol}.NS?interval=1d&range=1y`;
     const res = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       signal: AbortSignal.timeout(5000),
