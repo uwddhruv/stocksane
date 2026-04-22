@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 
 interface CheckResult {
@@ -47,21 +47,36 @@ export default function AppPage() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<CheckResult | null>(null);
   const [error, setError] = useState("");
-  const [pastChecks, setPastChecks] = useState<PastCheck[]>(() => {
-    if (typeof window === "undefined") return [];
-    const stored = localStorage.getItem("stocksane_checks");
-    if (!stored) return [];
-    try {
-      const parsed = JSON.parse(stored);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  });
+  const [pastChecks, setPastChecks] = useState<PastCheck[]>([]);
   const [suggestions, setSuggestions] = useState<StockSuggestion[]>([]);
   const [searchingStocks, setSearchingStocks] = useState(false);
   const [selectedStockLabel, setSelectedStockLabel] = useState("");
   const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const stored = localStorage.getItem("stocksane_checks");
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) {
+          const timer = setTimeout(() => {
+            setPastChecks(parsed);
+          }, 0);
+          return () => clearTimeout(timer);
+        }
+      } catch {
+        // ignore malformed local cache
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (searchDebounceRef.current) {
+        clearTimeout(searchDebounceRef.current);
+      }
+    };
+  }, []);
 
   const fetchSuggestions = async (query: string) => {
     if (!query.trim()) {
@@ -188,6 +203,11 @@ export default function AppPage() {
                   onChange={(e) => handleSymbolInputChange(e.target.value)}
                   placeholder="Type and pick a stock (e.g. RELIANCE, AAPL)"
                   list="stock-symbol-suggestions"
+                  role="combobox"
+                  aria-autocomplete="list"
+                  aria-expanded={suggestions.length > 0}
+                  aria-owns="stock-symbol-suggestions"
+                  aria-controls="stock-symbol-suggestions"
                   className="w-full bg-slate-900 border border-slate-600 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-[#22c55e] transition-colors"
                 />
                 <datalist id="stock-symbol-suggestions">
@@ -201,7 +221,7 @@ export default function AppPage() {
                 </datalist>
                 <p className="mt-2 text-xs text-slate-500">
                   {searchingStocks
-                    ? "Searching across 2000+ live market symbols..."
+                    ? "Searching symbols (top 20 matches shown)..."
                     : selectedStockLabel || "Search and select from live suggestions to avoid typing full names."}
                 </p>
               </div>

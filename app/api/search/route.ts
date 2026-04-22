@@ -37,7 +37,7 @@ export async function GET(req: NextRequest) {
       .filter((quote) => quote.symbol && (quote.quoteType === "EQUITY" || quote.quoteType === "ETF"))
       .map((quote) => ({
         symbol: quote.symbol,
-        name: quote.shortname ?? quote.longname ?? quote.symbol,
+        name: quote.shortname ?? quote.longname ?? "Name unavailable",
         exchange: quote.exchDisp ?? "Unknown Exchange",
       }))
       .slice(0, 20);

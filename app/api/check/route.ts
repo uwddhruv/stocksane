@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search";
+// Used to compute week-over-week momentum from daily prices.
+const WEEK_LOOKBACK_SECONDS = 7 * 24 * 60 * 60;
 
 type StockData = {
   price: number;
@@ -9,7 +11,14 @@ type StockData = {
   changePercent: number;
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 function sanitizeSymbol(input: string): string {
+  // Keep characters used by market data providers:
+  // "." for exchange suffixes (RELIANCE.NS), "-" for share classes (BRK-B),
+  // "^" for indices (^NSEI), and "=" for forex pairs (EURUSD=X).
   return input.toUpperCase().replace(/[^A-Z0-9.\-^=]/g, "");
 }
 
@@ -30,10 +39,27 @@ async function fetchChartForSymbol(symbol: string): Promise<StockData> {
   const meta = result?.meta;
   if (!meta?.regularMarketPrice) throw new Error("No chart data");
 
-  const closes: number[] = result?.indicators?.quote?.[0]?.close ?? [];
-  const recentCloses = closes.filter((price: unknown): price is number => typeof price === "number").slice(-8);
-  const weekAgoPrice = recentCloses[0] ?? meta.regularMarketPrice;
+  const closes: unknown[] = Array.isArray(result?.indicators?.quote?.[0]?.close) ? result.indicators.quote[0].close : [];
+  const timestamps: unknown[] = Array.isArray(result?.timestamp) ? result.timestamp : [];
+  const entries: Array<{ close: number; timestamp: number }> = [];
+  const pairCount = Math.min(closes.length, timestamps.length);
+  for (let index = 0; index < pairCount; index += 1) {
+    const close = closes[index];
+    const timestamp = timestamps[index];
+    if (typeof close === "number" && typeof timestamp === "number") {
+      entries.push({ close, timestamp });
+    }
+  }
   const currentPrice = meta.regularMarketPrice;
+  const latestTimestamp = entries.at(-1)?.timestamp ?? Math.floor(Date.now() / 1000);
+  const targetTimestamp = latestTimestamp - WEEK_LOOKBACK_SECONDS;
+  let weekAgoPrice = currentPrice;
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    if (entries[i].timestamp <= targetTimestamp) {
+      weekAgoPrice = entries[i].close;
+      break;
+    }
+  }
   const weekChange = weekAgoPrice > 0 ? ((currentPrice - weekAgoPrice) / weekAgoPrice) * 100 : 0;
 
   return {
@@ -49,7 +75,7 @@ async function fetchStockData(symbol: string) {
   if (!safeSymbol) throw new Error("Invalid symbol");
 
   const candidateSymbols = [safeSymbol];
-  if (!safeSymbol.includes(".") && !safeSymbol.includes("=")) {
+  if (/^[A-Z0-9]+$/.test(safeSymbol)) {
     candidateSymbols.push(`${safeSymbol}.NS`, `${safeSymbol}.BO`);
   }
 
@@ -61,7 +87,8 @@ async function fetchStockData(symbol: string) {
     }
   }
 
-  throw new Error("Could not fetch stock data");
+  // Internal error code mapped to user-friendly messages in the POST catch block.
+  throw new Error(`SYMBOL_DATA_UNAVAILABLE:${safeSymbol}`);
 }
 
 async function resolveSymbol(rawSymbol: string): Promise<string> {
@@ -80,7 +107,7 @@ async function resolveSymbol(rawSymbol: string): Promise<string> {
     headers: { "User-Agent": "Mozilla/5.0" },
     signal: AbortSignal.timeout(5000),
   });
-  if (!res.ok) throw new Error("Could not resolve symbol");
+  if (!res.ok) throw new Error("SYMBOL_RESOLUTION_FAILED");
 
   const data = await res.json();
   const quote = data?.quotes?.find(
@@ -88,7 +115,7 @@ async function resolveSymbol(rawSymbol: string): Promise<string> {
       (item.quoteType === "EQUITY" || item.quoteType === "ETF") && item.symbol
   );
 
-  if (!quote?.symbol) throw new Error("No matching stock found");
+  if (!quote?.symbol) throw new Error("SYMBOL_NOT_FOUND");
   return sanitizeSymbol(quote.symbol);
 }
 
@@ -157,22 +184,28 @@ function getVerdict(warnings: string[]): string {
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { symbol, amount, portfolioValue, riskLevel } = body as {
-      symbol?: string;
-      amount?: number;
-      portfolioValue?: number | null;
-      riskLevel?: string;
-    };
-
-    if (!symbol || !amount) {
+    const body: unknown = await req.json();
+    if (!isRecord(body)) {
+      return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    }
+    const payload = body;
+    const symbol = typeof payload.symbol === "string" ? payload.symbol.trim() : "";
+    if (!symbol || payload.amount == null) {
       return NextResponse.json({ error: "Symbol and amount are required" }, { status: 400 });
     }
+    const amountValue = typeof payload.amount === "number" ? payload.amount : Number(payload.amount);
+    const portfolioValue = payload.portfolioValue == null ? null : Number(payload.portfolioValue);
+    const riskLevel = typeof payload.riskLevel === "string" ? payload.riskLevel : "Medium";
+    if (!Number.isFinite(amountValue) || amountValue <= 0) {
+      return NextResponse.json({ error: "Amount must be a positive number" }, { status: 400 });
+    }
+    const normalizedPortfolioValue =
+      portfolioValue != null && Number.isFinite(portfolioValue) && portfolioValue > 0 ? portfolioValue : null;
 
     const resolvedSymbol = await resolveSymbol(symbol);
     const stockData = await fetchStockData(resolvedSymbol);
     const displaySymbol = formatSymbolForDisplay(resolvedSymbol);
-    const warnings = runRuleEngine(stockData, amount, portfolioValue ?? null, riskLevel ?? "Medium", displaySymbol);
+    const warnings = runRuleEngine(stockData, amountValue, normalizedPortfolioValue, riskLevel, displaySymbol);
     const verdict = getVerdict(warnings);
 
     return NextResponse.json({
@@ -188,6 +221,16 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     console.error("API error:", err);
-    return NextResponse.json({ error: "Couldn't fetch live market data for this stock." }, { status: 500 });
+    const message = err instanceof Error ? err.message : "";
+    if (message === "SYMBOL_NOT_FOUND") {
+      return NextResponse.json({ error: "No matching stock was found. Please select a symbol from the dropdown." }, { status: 404 });
+    }
+    if (message.startsWith("SYMBOL_DATA_UNAVAILABLE:")) {
+      return NextResponse.json({ error: "Live data is unavailable for this symbol right now. Please try another one." }, { status: 502 });
+    }
+    if (message === "SYMBOL_RESOLUTION_FAILED") {
+      return NextResponse.json({ error: "Unable to resolve the stock symbol right now. Please try again shortly." }, { status: 502 });
+    }
+    return NextResponse.json({ error: "An unexpected error occurred. Please try again shortly." }, { status: 500 });
   }
 }
