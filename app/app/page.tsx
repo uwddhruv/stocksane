@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 
 interface CheckResult {
@@ -19,6 +19,12 @@ interface PastCheck {
   symbol: string;
   verdict: string;
   timestamp: string;
+}
+
+interface StockSuggestion {
+  symbol: string;
+  name: string;
+  exchange: string;
 }
 
 const verdictColor = (verdict: string) => {
@@ -42,17 +48,78 @@ export default function AppPage() {
   const [result, setResult] = useState<CheckResult | null>(null);
   const [error, setError] = useState("");
   const [pastChecks, setPastChecks] = useState<PastCheck[]>([]);
+  const [suggestions, setSuggestions] = useState<StockSuggestion[]>([]);
+  const [searchingStocks, setSearchingStocks] = useState(false);
+  const [selectedStockLabel, setSelectedStockLabel] = useState("");
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const stored = localStorage.getItem("stocksane_checks");
     if (stored) {
       try {
-        setPastChecks(JSON.parse(stored));
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) {
+          const timer = setTimeout(() => {
+            setPastChecks(parsed);
+          }, 0);
+          return () => clearTimeout(timer);
+        }
       } catch {
-        /* ignore */
+        // ignore malformed local cache
       }
     }
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (searchDebounceRef.current) {
+        clearTimeout(searchDebounceRef.current);
+      }
+    };
+  }, []);
+
+  const fetchSuggestions = async (query: string) => {
+    if (!query.trim()) {
+      setSuggestions([]);
+      setSearchingStocks(false);
+      return;
+    }
+
+    setSearchingStocks(true);
+    try {
+      const res = await fetch(`/api/search?q=${encodeURIComponent(query.trim())}`);
+      const data = await res.json();
+      if (res.ok && Array.isArray(data.results)) {
+        setSuggestions(data.results);
+      } else {
+        setSuggestions([]);
+      }
+    } catch {
+      setSuggestions([]);
+    } finally {
+      setSearchingStocks(false);
+    }
+  };
+
+  const handleSymbolInputChange = (nextValue: string) => {
+    setSymbol(nextValue);
+    const picked = suggestions.find((item) => item.symbol === nextValue);
+    setSelectedStockLabel(picked ? `${picked.name} · ${picked.exchange}` : "");
+
+    if (searchDebounceRef.current) {
+      clearTimeout(searchDebounceRef.current);
+    }
+
+    if (!nextValue.trim()) {
+      setSuggestions([]);
+      setSearchingStocks(false);
+      return;
+    }
+
+    searchDebounceRef.current = setTimeout(() => {
+      void fetchSuggestions(nextValue);
+    }, 250);
+  };
 
   const savePastCheck = (sym: string, verdict: string) => {
     const newCheck: PastCheck = {
@@ -102,6 +169,9 @@ export default function AppPage() {
     setAmount("");
     setPortfolioValue("");
     setRiskLevel("Medium");
+    setSuggestions([]);
+    setSelectedStockLabel("");
+    setSearchingStocks(false);
     setError("");
   };
 
@@ -127,14 +197,34 @@ export default function AppPage() {
               <label className="block text-sm font-semibold text-slate-300 mb-2">
                 Stock Symbol / Name <span className="text-[#ef4444]">*</span>
               </label>
-              <input
-                type="text"
-                value={symbol}
-                onChange={(e) => setSymbol(e.target.value)}
-                placeholder="e.g. RELIANCE, TCS, INFY"
-                className="w-full bg-slate-900 border border-slate-600 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-[#22c55e] transition-colors"
-              />
-            </div>
+                <input
+                  type="text"
+                  value={symbol}
+                  onChange={(e) => handleSymbolInputChange(e.target.value)}
+                  placeholder="Type and pick a stock (e.g. RELIANCE, AAPL)"
+                  list="stock-symbol-suggestions"
+                  role="combobox"
+                  aria-autocomplete="list"
+                  aria-expanded={suggestions.length > 0}
+                  aria-owns="stock-symbol-suggestions"
+                  aria-controls="stock-symbol-suggestions"
+                  className="w-full bg-slate-900 border border-slate-600 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-[#22c55e] transition-colors"
+                />
+                <datalist id="stock-symbol-suggestions">
+                  {suggestions.map((item) => (
+                    <option
+                      key={`${item.symbol}-${item.exchange}`}
+                      value={item.symbol}
+                      label={`${item.name} · ${item.exchange}`}
+                    />
+                  ))}
+                </datalist>
+                <p className="mt-2 text-xs text-slate-500">
+                  {searchingStocks
+                    ? "Searching symbols (top 20 matches shown)..."
+                    : selectedStockLabel || "Search and select from live suggestions to avoid typing full names."}
+                </p>
+              </div>
 
             <div>
               <label className="block text-sm font-semibold text-slate-300 mb-2">

@@ -1,46 +1,132 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const mockStocks: Record<string, { price: number; high52: number; low52: number; changePercent: number }> = {
-  RELIANCE: { price: 2850, high52: 3024, low52: 2220, changePercent: 12.5 },
-  TCS: { price: 3920, high52: 4255, low52: 3200, changePercent: 2.1 },
-  INFY: { price: 1680, high52: 1953, low52: 1351, changePercent: -1.2 },
-  WIPRO: { price: 520, high52: 620, low52: 380, changePercent: 5.3 },
-  HDFC: { price: 1650, high52: 1794, low52: 1363, changePercent: 3.8 },
-  ICICIBANK: { price: 1080, high52: 1196, low52: 872, changePercent: 9.1 },
-  DEFAULT: { price: 1000, high52: 1200, low52: 700, changePercent: 8.0 },
+const YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search";
+// Used to compute week-over-week momentum from daily prices.
+const WEEK_LOOKBACK_SECONDS = 7 * 24 * 60 * 60;
+
+type StockData = {
+  price: number;
+  high52: number;
+  low52: number;
+  changePercent: number;
 };
 
-async function fetchStockData(symbol: string) {
-  try {
-    // Sanitize symbol: allow only alphanumeric characters and dots
-    const safeSymbol = symbol.toUpperCase().replace(/[^A-Z0-9.]/g, "");
-    if (!safeSymbol) throw new Error("Invalid symbol");
-    const yahooUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(safeSymbol)}.NS`);
-    yahooUrl.searchParams.set("interval", "1d");
-    yahooUrl.searchParams.set("range", "1y");
-    const res = await fetch(yahooUrl.toString(), {
-      headers: { "User-Agent": "Mozilla/5.0" },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) throw new Error("Yahoo Finance API error");
-    const data = await res.json();
-    const meta = data?.chart?.result?.[0]?.meta;
-    if (!meta) throw new Error("No data");
-    const closes: number[] = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close ?? [];
-    const recentCloses = closes.filter(Boolean).slice(-8);
-    const weekAgoPrice = recentCloses[0] ?? meta.regularMarketPrice;
-    const currentPrice = meta.regularMarketPrice;
-    const weekChange = weekAgoPrice > 0 ? ((currentPrice - weekAgoPrice) / weekAgoPrice) * 100 : 0;
-    return {
-      price: currentPrice,
-      high52: meta.fiftyTwoWeekHigh ?? currentPrice * 1.2,
-      low52: meta.fiftyTwoWeekLow ?? currentPrice * 0.8,
-      changePercent: weekChange,
-    };
-  } catch {
-    const mock = mockStocks[symbol] ?? mockStocks.DEFAULT;
-    return mock;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function sanitizeSymbol(input: string): string {
+  // Keep characters used by market data providers:
+  // "." for exchange suffixes (RELIANCE.NS), "-" for share classes (BRK-B),
+  // "^" for indices (^NSEI), and "=" for forex pairs (EURUSD=X).
+  return input.toUpperCase().replace(/[^A-Z0-9.\-^=]/g, "");
+}
+
+async function fetchChartForSymbol(symbol: string): Promise<StockData> {
+  const yahooUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+  yahooUrl.searchParams.set("interval", "1d");
+  yahooUrl.searchParams.set("range", "1y");
+
+  const res = await fetch(yahooUrl.toString(), {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    signal: AbortSignal.timeout(5000),
+  });
+
+  if (!res.ok) throw new Error("Yahoo Finance API error");
+
+  const data = await res.json();
+  const result = data?.chart?.result?.[0];
+  const meta = result?.meta;
+  if (!meta?.regularMarketPrice) throw new Error("No chart data");
+
+  const closes: unknown[] = Array.isArray(result?.indicators?.quote?.[0]?.close) ? result.indicators.quote[0].close : [];
+  const timestamps: unknown[] = Array.isArray(result?.timestamp) ? result.timestamp : [];
+  const entries: Array<{ close: number; timestamp: number }> = [];
+  const pairCount = Math.min(closes.length, timestamps.length);
+  for (let index = 0; index < pairCount; index += 1) {
+    const close = closes[index];
+    const timestamp = timestamps[index];
+    if (typeof close === "number" && typeof timestamp === "number") {
+      entries.push({ close, timestamp });
+    }
   }
+  const currentPrice = meta.regularMarketPrice;
+  const latestTimestamp = entries.at(-1)?.timestamp ?? Math.floor(Date.now() / 1000);
+  const targetTimestamp = latestTimestamp - WEEK_LOOKBACK_SECONDS;
+  let weekAgoPrice = currentPrice;
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    if (entries[i].timestamp <= targetTimestamp) {
+      weekAgoPrice = entries[i].close;
+      break;
+    }
+  }
+  const weekChange = weekAgoPrice > 0 ? ((currentPrice - weekAgoPrice) / weekAgoPrice) * 100 : 0;
+
+  return {
+    price: currentPrice,
+    high52: meta.fiftyTwoWeekHigh ?? currentPrice,
+    low52: meta.fiftyTwoWeekLow ?? currentPrice,
+    changePercent: weekChange,
+  };
+}
+
+async function fetchStockData(symbol: string) {
+  const safeSymbol = sanitizeSymbol(symbol);
+  if (!safeSymbol) throw new Error("Invalid symbol");
+
+  const candidateSymbols = [safeSymbol];
+  if (/^[A-Z0-9]+$/.test(safeSymbol)) {
+    candidateSymbols.push(`${safeSymbol}.NS`, `${safeSymbol}.BO`);
+  }
+
+  for (const candidate of candidateSymbols) {
+    try {
+      return await fetchChartForSymbol(candidate);
+    } catch {
+      // Try next candidate
+    }
+  }
+
+  // Internal error code mapped to user-friendly messages in the POST catch block.
+  throw new Error(`SYMBOL_DATA_UNAVAILABLE:${safeSymbol}`);
+}
+
+async function resolveSymbol(rawSymbol: string): Promise<string> {
+  const trimmed = rawSymbol.trim();
+  const direct = sanitizeSymbol(trimmed);
+  if (direct && !trimmed.includes(" ")) {
+    return direct;
+  }
+
+  const url = new URL(YAHOO_SEARCH_URL);
+  url.searchParams.set("q", trimmed);
+  url.searchParams.set("quotesCount", "10");
+  url.searchParams.set("newsCount", "0");
+
+  const res = await fetch(url.toString(), {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error("SYMBOL_RESOLUTION_FAILED");
+
+  const data = await res.json();
+  const quote = data?.quotes?.find(
+    (item: { quoteType?: string; symbol?: string }) =>
+      (item.quoteType === "EQUITY" || item.quoteType === "ETF") && item.symbol
+  );
+
+  if (!quote?.symbol) throw new Error("SYMBOL_NOT_FOUND");
+  return sanitizeSymbol(quote.symbol);
+}
+
+function formatSymbolForDisplay(input: string): string {
+  const safe = sanitizeSymbol(input);
+  if (!safe) return input.toUpperCase();
+  const normalized = safe.replace(/\.NS$|\.BO$/, "");
+  if (/^[A-Z0-9]+$/.test(normalized)) {
+    return normalized;
+  }
+  return safe;
 }
 
 function runRuleEngine(
@@ -98,22 +184,35 @@ function getVerdict(warnings: string[]): string {
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { symbol, amount, portfolioValue, riskLevel } = body;
-
-    if (!symbol || !amount) {
+    const body: unknown = await req.json();
+    if (!isRecord(body)) {
+      return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    }
+    const payload = body;
+    const symbol = typeof payload.symbol === "string" ? payload.symbol.trim() : "";
+    if (!symbol || payload.amount == null) {
       return NextResponse.json({ error: "Symbol and amount are required" }, { status: 400 });
     }
+    const amountValue = typeof payload.amount === "number" ? payload.amount : Number(payload.amount);
+    const portfolioValue = payload.portfolioValue == null ? null : Number(payload.portfolioValue);
+    const riskLevel = typeof payload.riskLevel === "string" ? payload.riskLevel : "Medium";
+    if (!Number.isFinite(amountValue) || amountValue <= 0) {
+      return NextResponse.json({ error: "Amount must be a positive number" }, { status: 400 });
+    }
+    const normalizedPortfolioValue =
+      portfolioValue != null && Number.isFinite(portfolioValue) && portfolioValue > 0 ? portfolioValue : null;
 
-    const stockData = await fetchStockData(symbol);
-    const warnings = runRuleEngine(stockData, amount, portfolioValue, riskLevel ?? "Medium", symbol);
+    const resolvedSymbol = await resolveSymbol(symbol);
+    const stockData = await fetchStockData(resolvedSymbol);
+    const displaySymbol = formatSymbolForDisplay(resolvedSymbol);
+    const warnings = runRuleEngine(stockData, amountValue, normalizedPortfolioValue, riskLevel, displaySymbol);
     const verdict = getVerdict(warnings);
 
     return NextResponse.json({
       verdict,
       warnings,
       stockData: {
-        symbol: symbol.toUpperCase(),
+        symbol: displaySymbol,
         price: Math.round(stockData.price * 100) / 100,
         high52: Math.round(stockData.high52 * 100) / 100,
         low52: Math.round(stockData.low52 * 100) / 100,
@@ -122,6 +221,16 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     console.error("API error:", err);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    const message = err instanceof Error ? err.message : "";
+    if (message === "SYMBOL_NOT_FOUND") {
+      return NextResponse.json({ error: "No matching stock was found. Please select a symbol from the dropdown." }, { status: 404 });
+    }
+    if (message.startsWith("SYMBOL_DATA_UNAVAILABLE:")) {
+      return NextResponse.json({ error: "Live data is unavailable for this symbol right now. Please try another one." }, { status: 502 });
+    }
+    if (message === "SYMBOL_RESOLUTION_FAILED") {
+      return NextResponse.json({ error: "Unable to resolve the stock symbol right now. Please try again shortly." }, { status: 502 });
+    }
+    return NextResponse.json({ error: "An unexpected error occurred. Please try again shortly." }, { status: 500 });
   }
 }
