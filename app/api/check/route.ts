@@ -1,46 +1,105 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const mockStocks: Record<string, { price: number; high52: number; low52: number; changePercent: number }> = {
-  RELIANCE: { price: 2850, high52: 3024, low52: 2220, changePercent: 12.5 },
-  TCS: { price: 3920, high52: 4255, low52: 3200, changePercent: 2.1 },
-  INFY: { price: 1680, high52: 1953, low52: 1351, changePercent: -1.2 },
-  WIPRO: { price: 520, high52: 620, low52: 380, changePercent: 5.3 },
-  HDFC: { price: 1650, high52: 1794, low52: 1363, changePercent: 3.8 },
-  ICICIBANK: { price: 1080, high52: 1196, low52: 872, changePercent: 9.1 },
-  DEFAULT: { price: 1000, high52: 1200, low52: 700, changePercent: 8.0 },
+const YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search";
+
+type StockData = {
+  price: number;
+  high52: number;
+  low52: number;
+  changePercent: number;
 };
 
+function sanitizeSymbol(input: string): string {
+  return input.toUpperCase().replace(/[^A-Z0-9.\-^=]/g, "");
+}
+
+async function fetchChartForSymbol(symbol: string): Promise<StockData> {
+  const yahooUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+  yahooUrl.searchParams.set("interval", "1d");
+  yahooUrl.searchParams.set("range", "1y");
+
+  const res = await fetch(yahooUrl.toString(), {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    signal: AbortSignal.timeout(5000),
+  });
+
+  if (!res.ok) throw new Error("Yahoo Finance API error");
+
+  const data = await res.json();
+  const result = data?.chart?.result?.[0];
+  const meta = result?.meta;
+  if (!meta?.regularMarketPrice) throw new Error("No chart data");
+
+  const closes: number[] = result?.indicators?.quote?.[0]?.close ?? [];
+  const recentCloses = closes.filter((price: unknown): price is number => typeof price === "number").slice(-8);
+  const weekAgoPrice = recentCloses[0] ?? meta.regularMarketPrice;
+  const currentPrice = meta.regularMarketPrice;
+  const weekChange = weekAgoPrice > 0 ? ((currentPrice - weekAgoPrice) / weekAgoPrice) * 100 : 0;
+
+  return {
+    price: currentPrice,
+    high52: meta.fiftyTwoWeekHigh ?? currentPrice,
+    low52: meta.fiftyTwoWeekLow ?? currentPrice,
+    changePercent: weekChange,
+  };
+}
+
 async function fetchStockData(symbol: string) {
-  try {
-    // Sanitize symbol: allow only alphanumeric characters and dots
-    const safeSymbol = symbol.toUpperCase().replace(/[^A-Z0-9.]/g, "");
-    if (!safeSymbol) throw new Error("Invalid symbol");
-    const yahooUrl = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(safeSymbol)}.NS`);
-    yahooUrl.searchParams.set("interval", "1d");
-    yahooUrl.searchParams.set("range", "1y");
-    const res = await fetch(yahooUrl.toString(), {
-      headers: { "User-Agent": "Mozilla/5.0" },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) throw new Error("Yahoo Finance API error");
-    const data = await res.json();
-    const meta = data?.chart?.result?.[0]?.meta;
-    if (!meta) throw new Error("No data");
-    const closes: number[] = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close ?? [];
-    const recentCloses = closes.filter(Boolean).slice(-8);
-    const weekAgoPrice = recentCloses[0] ?? meta.regularMarketPrice;
-    const currentPrice = meta.regularMarketPrice;
-    const weekChange = weekAgoPrice > 0 ? ((currentPrice - weekAgoPrice) / weekAgoPrice) * 100 : 0;
-    return {
-      price: currentPrice,
-      high52: meta.fiftyTwoWeekHigh ?? currentPrice * 1.2,
-      low52: meta.fiftyTwoWeekLow ?? currentPrice * 0.8,
-      changePercent: weekChange,
-    };
-  } catch {
-    const mock = mockStocks[symbol] ?? mockStocks.DEFAULT;
-    return mock;
+  const safeSymbol = sanitizeSymbol(symbol);
+  if (!safeSymbol) throw new Error("Invalid symbol");
+
+  const candidateSymbols = [safeSymbol];
+  if (!safeSymbol.includes(".") && !safeSymbol.includes("=")) {
+    candidateSymbols.push(`${safeSymbol}.NS`, `${safeSymbol}.BO`);
   }
+
+  for (const candidate of candidateSymbols) {
+    try {
+      return await fetchChartForSymbol(candidate);
+    } catch {
+      // Try next candidate
+    }
+  }
+
+  throw new Error("Could not fetch stock data");
+}
+
+async function resolveSymbol(rawSymbol: string): Promise<string> {
+  const trimmed = rawSymbol.trim();
+  const direct = sanitizeSymbol(trimmed);
+  if (direct && !trimmed.includes(" ")) {
+    return direct;
+  }
+
+  const url = new URL(YAHOO_SEARCH_URL);
+  url.searchParams.set("q", trimmed);
+  url.searchParams.set("quotesCount", "10");
+  url.searchParams.set("newsCount", "0");
+
+  const res = await fetch(url.toString(), {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error("Could not resolve symbol");
+
+  const data = await res.json();
+  const quote = data?.quotes?.find(
+    (item: { quoteType?: string; symbol?: string }) =>
+      (item.quoteType === "EQUITY" || item.quoteType === "ETF") && item.symbol
+  );
+
+  if (!quote?.symbol) throw new Error("No matching stock found");
+  return sanitizeSymbol(quote.symbol);
+}
+
+function formatSymbolForDisplay(input: string): string {
+  const safe = sanitizeSymbol(input);
+  if (!safe) return input.toUpperCase();
+  const normalized = safe.replace(/\.NS$|\.BO$/, "");
+  if (/^[A-Z0-9]+$/.test(normalized)) {
+    return normalized;
+  }
+  return safe;
 }
 
 function runRuleEngine(
@@ -99,21 +158,28 @@ function getVerdict(warnings: string[]): string {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { symbol, amount, portfolioValue, riskLevel } = body;
+    const { symbol, amount, portfolioValue, riskLevel } = body as {
+      symbol?: string;
+      amount?: number;
+      portfolioValue?: number | null;
+      riskLevel?: string;
+    };
 
     if (!symbol || !amount) {
       return NextResponse.json({ error: "Symbol and amount are required" }, { status: 400 });
     }
 
-    const stockData = await fetchStockData(symbol);
-    const warnings = runRuleEngine(stockData, amount, portfolioValue, riskLevel ?? "Medium", symbol);
+    const resolvedSymbol = await resolveSymbol(symbol);
+    const stockData = await fetchStockData(resolvedSymbol);
+    const displaySymbol = formatSymbolForDisplay(resolvedSymbol);
+    const warnings = runRuleEngine(stockData, amount, portfolioValue ?? null, riskLevel ?? "Medium", displaySymbol);
     const verdict = getVerdict(warnings);
 
     return NextResponse.json({
       verdict,
       warnings,
       stockData: {
-        symbol: symbol.toUpperCase(),
+        symbol: displaySymbol,
         price: Math.round(stockData.price * 100) / 100,
         high52: Math.round(stockData.high52 * 100) / 100,
         low52: Math.round(stockData.low52 * 100) / 100,
@@ -122,6 +188,6 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     console.error("API error:", err);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return NextResponse.json({ error: "Couldn't fetch live market data for this stock." }, { status: 500 });
   }
 }
